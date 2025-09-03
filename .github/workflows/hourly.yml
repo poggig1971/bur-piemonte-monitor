@@ -1,0 +1,47 @@
+name: BUR Piemonte monitor
+
+on:
+  schedule:
+    - cron: "5 7-16 * * *"   # 09:05–18:05 Europe/Rome (cron in UTC)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run job
+        env:
+          YEAR: "2025"
+          DRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.DRIVE_SERVICE_ACCOUNT_JSON }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO:   ${{ secrets.MAIL_TO }}
+        run: python run_bur_job.py
+
+      - name: Persist state if changed
+        run: |
+          if git status --porcelain | grep -q "state.json"; then
+            git config user.email "actions@github.com"
+            git config user.name "github-actions"
+            git add state.json
+            git commit -m "Update state [skip ci]" || true
+            git push || true
+          fi
