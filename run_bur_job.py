@@ -13,7 +13,7 @@ import pdfkit  # conversione HTML -> PDF offline
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 # ---------- Config ----------
 TZ = ZoneInfo("Europe/Rome")
@@ -39,7 +39,7 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT") or "465")
 MAIL_TO   = [x.strip() for x in os.getenv("MAIL_TO", "").split(",") if x.strip()]
 
-STATE_FILE = "state.json"
+STATE_FILE = "state.json"  # copia locale (solo per debug); lo stato vero è su Drive
 
 # ---------- HTTP session (anti-504) ----------
 def http_session():
@@ -136,24 +136,104 @@ def render_pdf_offline(url: str, out_path: str, session: requests.Session):
         except FileNotFoundError:
             pass
 
-# ---------- Upload su Drive ----------
+    # log dimensione
+    try:
+        sz = os.path.getsize(out_path)
+        print(f"[DBG] Creato PDF: {out_path} ({sz} bytes)")
+    except Exception as e:
+        print(f"[DBG] Stat PDF fallita per {out_path}: {e}")
+
+# ---------- Drive helpers ----------
 def drive_client():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(SERVICE_ACCOUNT_JSON),
         scopes=["https://www.googleapis.com/auth/drive"]
     )
+    ce = json.loads(SERVICE_ACCOUNT_JSON).get("client_email", "")
+    if ce:
+        print("[DBG] Service Account:", ce[:4] + "…" + ce[-12:])
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+def drive_check_folder(drive):
+    try:
+        meta = drive.files().get(
+            fileId=DRIVE_FOLDER_ID,
+            fields="id,name,driveId,parents,mimeType",
+            supportsAllDrives=True
+        ).execute()
+        print(f"[DBG] Drive folder OK: name={meta.get('name')} id={meta.get('id')} driveId={meta.get('driveId')}")
+        return True
+    except Exception as e:
+        print("[ERR] Cartella Drive non accessibile. Verifica ID e condivisione con la service account. Dettagli:", e)
+        return False
+
 def upload_to_drive(drive, file_path:str, name:str) -> dict:
-    media = MediaIoBaseUpload(open(file_path,"rb"), mimetype="application/pdf", resumable=True)
-    meta = {"name": name, "parents":[DRIVE_FOLDER_ID]}
-    f = drive.files().create(body=meta, media_body=media, fields="id,name,webViewLink,webContentLink").execute()
-    return f
+    try:
+        media = MediaIoBaseUpload(open(file_path,"rb"), mimetype="application/pdf", resumable=True)
+        meta = {"name": name, "parents":[DRIVE_FOLDER_ID]}
+        f = drive.files().create(
+            body=meta, media_body=media,
+            fields="id,name,webViewLink,webContentLink,parents",
+            supportsAllDrives=True
+        ).execute()
+        print(f"[DBG] Caricato su Drive: {f.get('name')} (id={f.get('id')})")
+        return f
+    except Exception as ex:
+        print(f"[ERR] Upload su Drive fallito per {name}: {ex}")
+        raise
 
 def share_with(drive, file_id:str, emails:List[str]):
     # Condivide in sola lettura con una o più mail (opzionale)
     for e in emails:
-        drive.permissions().create(fileId=file_id, body={"type":"user","role":"reader","emailAddress":e}, sendNotificationEmail=False).execute()
+        try:
+            drive.permissions().create(
+                fileId=file_id,
+                body={"type":"user","role":"reader","emailAddress":e},
+                sendNotificationEmail=False,
+                supportsAllDrives=True
+            ).execute()
+        except Exception as ex:
+            print(f"[DBG] share_with fallita per {e}: {ex}")
+
+# ---- Stato su Drive (anti-duplicati) ----
+def drive_find_state_file(drive):
+    q = f"'{DRIVE_FOLDER_ID}' in parents and name='bur_state.json' and trashed=false"
+    res = drive.files().list(
+        q=q, fields="files(id,name,size)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True, corpora="allDrives"
+    ).execute()
+    files = res.get("files", [])
+    return files[0] if files else None
+
+def drive_load_state(drive):
+    f = drive_find_state_file(drive)
+    if not f:
+        return {"last_number": None, "year": YEAR}
+    buf = io.BytesIO()
+    req = drive.files().get_media(fileId=f["id"])
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+    try:
+        state = json.load(io.TextIOWrapper(buf, encoding="utf-8"))
+        print(f"[DBG] Stato su Drive: {state}")
+        return state
+    except Exception:
+        return {"last_number": None, "year": YEAR}
+
+def drive_save_state(drive, state: dict):
+    data = json.dumps(state, ensure_ascii=False).encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="application/json", resumable=False)
+    f = drive_find_state_file(drive)
+    if f:
+        drive.files().update(fileId=f["id"], media_body=media, supportsAllDrives=True).execute()
+        print("[DBG] Stato aggiornato su Drive.")
+    else:
+        meta = {"name": "bur_state.json", "parents": [DRIVE_FOLDER_ID]}
+        drive.files().create(body=meta, media_body=media, supportsAllDrives=True).execute()
+        print("[DBG] Stato creato su Drive.")
 
 # ---------- Notifiche ----------
 def post_webhook(payload:dict):
@@ -186,14 +266,14 @@ def send_smtp(files:List[str], subject:str, body:str):
         smtp.login(SMTP_USER, SMTP_PASS)
         smtp.send_message(msg)
 
-# ---------- State ----------
-def load_state():
+# ---------- State locale (solo per debug) ----------
+def load_state_local():
     try:
         return json.load(open(STATE_FILE,"r",encoding="utf-8"))
     except FileNotFoundError:
         return {"last_number": None, "year": YEAR}
 
-def save_state(state:dict):
+def save_state_local(state:dict):
     json.dump(state, open(STATE_FILE,"w",encoding="utf-8"))
 
 # ---------- MAIN ----------
@@ -207,15 +287,18 @@ def main():
         return
 
     s = http_session()
-    st = load_state()
     drive = drive_client()
+    if not drive_check_folder(drive):
+        return
+
+    # Stato da Drive (persistente)
+    st = drive_load_state(drive)
 
     try:
         cur_num, cur_date = get_current_bur_number(s)
         print(f"Numero corrente BUR sul sito: n. {cur_num} (del {cur_date})")
     except Exception as e:
         print("Errore nel leggere il numero corrente:", e)
-        # fallback: prova il “prossimo” rispetto allo stato
         cur_num = (st.get("last_number") or 0)
         cur_date = ""
 
@@ -240,7 +323,7 @@ def main():
 
                 files_local.append(out_path)
                 meta = upload_to_drive(drive, out_path, out_name)
-                # (facoltativo) assicurati accesso a te/colleghi
+                # (facoltativo) accesso lettura per te/colleghi
                 share_with(drive, meta["id"], [SMTP_USER] if SMTP_USER else [])
                 uploaded.append(meta)
                 time.sleep(0.5)  # cortesia per il server
@@ -258,7 +341,7 @@ def main():
     }
     post_webhook(payload)
 
-    # Log diagnostico e invio diretto via SMTP (se configurato)
+    # Invio diretto via SMTP (se configurato)
     print(f"[DBG] files_local={len(files_local)}  MAIL_TO={len(MAIL_TO)}  SMTP_USER_set={bool(SMTP_USER)}  SMTP_PASS_set={bool(SMTP_PASS)}  SMTP_PORT={SMTP_PORT}")
     if files_local and SMTP_USER and SMTP_PASS and MAIL_TO and SMTP_PORT > 0:
         subj = f"BUR Piemonte n. {cur_num} — pubblicazione"
@@ -272,13 +355,15 @@ def main():
     else:
         print("[DBG] Invio email SKIPPED per condizione non soddisfatta.")
 
-    # Aggiorna stato (solo se non era un invio forzato)
+    # Aggiorna stato su Drive (evita doppie email ai prossimi run)
     if new_issue:
         st["last_number"] = cur_num
         st["year"] = YEAR
-        save_state(st)
+        drive_save_state(drive, st)
+        save_state_local(st)  # copia locale per debug
     print("Completato.")
 
 if __name__ == "__main__":
     main()
+
 
