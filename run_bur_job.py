@@ -32,7 +32,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", or "465"))
+SMTP_PORT = int(os.getenv("SMTP_PORT") or "465")
 MAIL_TO   = [x.strip() for x in os.getenv("MAIL_TO", "").split(",") if x.strip()]
 
 STATE_FILE = "state.json"
