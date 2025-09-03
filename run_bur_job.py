@@ -9,7 +9,7 @@ import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
-import pdfkit  # <-- nuovo: conversione HTML -> PDF offline
+import pdfkit  # conversione HTML -> PDF offline
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -75,22 +75,26 @@ def url_for(issue:int, page:str) -> str:
 
 def url_exists(url:str, s:requests.Session) -> bool:
     try:
-        r = s.get(url, timeout=20)
-        return r.status_code == 200
-    except Exception:
+        r = s.get(url, timeout=20, allow_redirects=True)
+        print(f"[DBG] URL check {r.status_code}: {url}")
+        return 200 <= r.status_code < 400
+    except Exception as e:
+        print(f"[DBG] URL check exception for {url}: {e}")
         return False
 
 # ---------- Rendering PDF offline (wkhtmltopdf/pdfkit) ----------
 def render_pdf_offline(url: str, out_path: str, session: requests.Session):
     """
-    Scarica l'HTML con requests (aggira i blocchi del WAF verso browser headless)
-    e lo converte in PDF offline con wkhtmltopdf (via pdfkit).
+    Scarica l'HTML con requests e lo converte in PDF offline con wkhtmltopdf (via pdfkit).
+    Evita i blocchi del WAF perché non usa un browser headless.
     """
+    # 1) Scarica HTML
     r = session.get(url, timeout=30)
     r.raise_for_status()
     r.encoding = r.apparent_encoding or "utf-8"
     html = r.text
 
+    # 2) Wrappa l'HTML (evita risorse esterne)
     title = f"Istantanea pagina: {url}"
     safe_url = escape(url)
     wrapped = f"""<!doctype html><html lang="it"><head>
@@ -109,4 +113,172 @@ def render_pdf_offline(url: str, out_path: str, session: requests.Session):
       {html}
     </body></html>"""
 
-    tmp_html = Path(ou_
+    # 3) Scrive file temporaneo HTML
+    tmp_html = Path(out_path).with_suffix(".tmp.html")
+    tmp_html.write_text(wrapped, encoding="utf-8")
+
+    # 4) Converte in PDF con wkhtmltopdf
+    options = {
+        "--quiet": None,
+        "--enable-local-file-access": None,
+        "--print-media-type": None,
+        "--margin-top": "10mm",
+        "--margin-bottom": "10mm",
+        "--margin-left": "8mm",
+        "--margin-right": "8mm",
+        "--encoding": "UTF-8",
+    }
+    try:
+        pdfkit.from_file(str(tmp_html), out_path, options=options)
+    finally:
+        try:
+            tmp_html.unlink()
+        except FileNotFoundError:
+            pass
+
+# ---------- Upload su Drive ----------
+def drive_client():
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(SERVICE_ACCOUNT_JSON),
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def upload_to_drive(drive, file_path:str, name:str) -> dict:
+    media = MediaIoBaseUpload(open(file_path,"rb"), mimetype="application/pdf", resumable=True)
+    meta = {"name": name, "parents":[DRIVE_FOLDER_ID]}
+    f = drive.files().create(body=meta, media_body=media, fields="id,name,webViewLink,webContentLink").execute()
+    return f
+
+def share_with(drive, file_id:str, emails:List[str]):
+    # Condivide in sola lettura con una o più mail (opzionale)
+    for e in emails:
+        drive.permissions().create(fileId=file_id, body={"type":"user","role":"reader","emailAddress":e}, sendNotificationEmail=False).execute()
+
+# ---------- Notifiche ----------
+def post_webhook(payload:dict):
+    if not WEBHOOK_URL: return
+    try:
+        requests.post(WEBHOOK_URL, json=payload, timeout=15)
+    except Exception as e:
+        print("Webhook error:", e)
+
+def send_smtp(files:List[str], subject:str, body:str):
+    if not (SMTP_USER and SMTP_PASS and MAIL_TO):
+        return
+    import smtplib, ssl, mimetypes
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["From"] = SMTP_USER
+    msg["To"] = ", ".join(MAIL_TO)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    for path in files:
+        ctype, _ = mimetypes.guess_type(path)
+        maintype, subtype = (ctype or "application/pdf").split("/", 1)
+        with open(path, "rb") as f:
+            msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as smtp:
+        smtp.login(SMTP_USER, SMTP_PASS)
+        smtp.send_message(msg)
+
+# ---------- State ----------
+def load_state():
+    try:
+        return json.load(open(STATE_FILE,"r",encoding="utf-8"))
+    except FileNotFoundError:
+        return {"last_number": None, "year": YEAR}
+
+def save_state(state:dict):
+    json.dump(state, open(STATE_FILE,"w",encoding="utf-8"))
+
+# ---------- MAIN ----------
+def main():
+    # Flag per test forzati (opzionali)
+    force_run = os.getenv("FORCE_RUN") == "1"
+    force_send = os.getenv("FORCE_SEND") == "1"
+
+    if not now_in_window() and not force_run:
+        print("Fuori fascia 09–18 Europe/Rome → esco.")
+        return
+
+    s = http_session()
+    st = load_state()
+    drive = drive_client()
+
+    try:
+        cur_num, cur_date = get_current_bur_number(s)
+        print(f"Numero corrente BUR sul sito: n. {cur_num} (del {cur_date})")
+    except Exception as e:
+        print("Errore nel leggere il numero corrente:", e)
+        # fallback: prova il “prossimo” rispetto allo stato
+        cur_num = (st.get("last_number") or 0)
+        cur_date = ""
+
+    new_issue = (st.get("last_number") != cur_num and cur_num is not None)
+
+    if not new_issue and not force_send:
+        print(f"Nessun nuovo BUR (ultimo noto: {st.get('last_number')}).")
+        return
+
+    print("Nuovo BUR rilevato o invio forzato! Procedo con PDF e upload.")
+    files_local = []
+    uploaded = []
+
+    for page in PAGES:
+        u = url_for(cur_num, page)
+        if url_exists(u, s):
+            out_name = f"BUR_{YEAR}_{cur_num}_{page}.pdf"
+            out_path = os.path.join(".", out_name)
+            try:
+                # snapshot HTML -> PDF offline (no browser, no blocchi)
+                render_pdf_offline(u, out_path, s)
+
+                files_local.append(out_path)
+                meta = upload_to_drive(drive, out_path, out_name)
+                # (facoltativo) assicurati accesso a te/colleghi
+                share_with(drive, meta["id"], [SMTP_USER] if SMTP_USER else [])
+                uploaded.append(meta)
+                time.sleep(0.5)  # cortesia per il server
+            except Exception as e:
+                print(f"Errore su {page}:", e)
+        else:
+            print(f"Pagina assente (ok): {u}")
+
+    # Notifica webhook (se lo usi)
+    payload = {
+        "bur_number": cur_num,
+        "date": cur_date,
+        "year": YEAR,
+        "files": uploaded,   # [{id,name,webViewLink,webContentLink}]
+    }
+    post_webhook(payload)
+
+    # Log diagnostico e invio diretto via SMTP (se configurato)
+    print(f"[DBG] files_local={len(files_local)}  MAIL_TO={len(MAIL_TO)}  SMTP_USER_set={bool(SMTP_USER)}  SMTP_PASS_set={bool(SMTP_PASS)}  SMTP_PORT={SMTP_PORT}")
+    if files_local and SMTP_USER and SMTP_PASS and MAIL_TO and SMTP_PORT > 0:
+        subj = f"BUR Piemonte n. {cur_num} — pubblicazione"
+        body = f"In allegato i PDF delle pagine (siste/supplementi) del BUR n. {cur_num} ({cur_date})."
+        try:
+            print("[DBG] Invio email via SMTP…")
+            send_smtp(files_local, subj, body)
+            print("[DBG] Email inviata.")
+        except Exception as e:
+            print("[ERR] SMTP:", repr(e))
+    else:
+        print("[DBG] Invio email SKIPPED per condizione non soddisfatta.")
+
+    # Aggiorna stato (solo se non era un invio forzato)
+    if new_issue:
+        st["last_number"] = cur_num
+        st["year"] = YEAR
+        save_state(st)
+    print("Completato.")
+
+if __name__ == "__main__":
+    main()
+
