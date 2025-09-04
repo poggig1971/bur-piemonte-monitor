@@ -28,16 +28,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run job
-              - name: Run job
         env:
           YEAR: "2025"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}   # es. 465
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO:   ${{ secrets.MAIL_TO }}
         run: python run_bur_job.py
-        
+
       - name: Persist state if changed
         run: |
           if git status --porcelain | grep -q "state.json"; then
