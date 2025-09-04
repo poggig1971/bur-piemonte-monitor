@@ -28,20 +28,16 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run job
+              - name: Run job
         env:
           YEAR: "2025"
-          FORCE_RUN: "1"      # forza esecuzione anche fuori fascia
-          FORCE_SEND: "1"     # forza generazione/invio anche se non è nuovo
-          DRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.DRIVE_SERVICE_ACCOUNT_JSON }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO:   ${{ secrets.MAIL_TO }}
         run: python run_bur_job.py
-
-
+        
       - name: Persist state if changed
         run: |
           if git status --porcelain | grep -q "state.json"; then
