@@ -2,7 +2,7 @@ name: BUR Piemonte monitor
 
 on:
   schedule:
-    - cron: "5 7-16 * * *"   # 09:05–18:05 Europe/Rome (cron in UTC)
+    - cron: "5 9,10,13,16 * * *"
   workflow_dispatch: {}
 
 permissions:
